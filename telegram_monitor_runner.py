@@ -1,17 +1,17 @@
-import logging
+#!/usr/bin/env python3
 import asyncio
+import logging
 import time
-import threading
-from typing import Optional, Dict, List
+from typing import Optional, Dict, Any, List, Tuple
 
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    AIORateLimiter,
     MessageHandler,
     filters,
+    AIORateLimiter,
 )
 
 from config import Config
@@ -21,218 +21,193 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-log = logging.getLogger("TG-MON")
+log = logging.getLogger("TG_MON")
 
 HELP = (
-    "Monitor-bot (maakt géén reservatie)\n\n"
-    "Gebruik:\n"
-    "/monitor <chassis> | <merk model> | <dd/mm/jjjj>\n"
-    "  ▶︎ Volgt de flow t/m het overzicht en monitort 24u lang.\n\n"
-    "/status  ▶︎ tussentijdse lijst met gevonden slots\n"
-    "/stop    ▶︎ stoppen en eindreport sturen\n\n"
-    "Voorbeeld:\n"
-    "/monitor ABC12345678901234 | Toyota Corolla | 01/01/2020"
+    "🔎 Monitor-bot (geen boekingen)\n\n"
+    "Commando’s:\n"
+    "• /monitor — start 24u monitoring van de **week van morgen** (geen weekends, max 3 werkdagen)\n"
+    "• /status — toon tussentijdse resultaten\n"
+    "• /stop — stop de monitoring en toon eindrapport\n"
+    "• /help — toon dit overzicht\n"
 )
 
-# Per chat state
-running_task: Dict[int, asyncio.Task] = {}
-stop_flags: Dict[int, bool] = {}
-buffers: Dict[int, List[dict]] = {}  # realtime events
-locks: Dict[int, threading.Lock] = {}
+# ---------- Per-chat state ----------
+class MonitorState:
+    def __init__(self):
+        self.task: Optional[asyncio.Task] = None
+        self.stop_flag: bool = False
+        # Lijst met tuples (timestamp_iso, "dd/mm/YYYY HH:MM")
+        self.found: List[Tuple[str, str]] = []
+        self.last_status: Dict[str, Any] = {}
+        self.started_at: float = time.time()
 
+# chat_id -> MonitorState
+SESSIONS: Dict[int, MonitorState] = {}
 
-def allowed_chat(update: Update) -> bool:
-    if not Config.TELEGRAM_CHAT_ID:
-        return True
-    try:
-        return str(update.effective_chat.id) == str(Config.TELEGRAM_CHAT_ID)
-    except Exception:
-        return False
-
-
-def fmt_report(events: List[dict]) -> str:
-    if not events:
-        return "Geen slots gedetecteerd."
-    lines = []
-    for ev in events:
-        lines.append(f"• {ev['slot']}  (gevonden: {ev['detected_at']})")
-    return "\n".join(lines[:1000])  # hard cap, Telegram limit safeguard
-
-
+# ---------- Handlers ----------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed_chat(update):
-        return await update.message.reply_text("⛔ Niet toegestaan voor deze chat.")
-    await update.message.reply_text("Monitor-bot klaar ✅\n\n" + HELP)
-
+    await update.message.reply_text("AIBV Monitor-bot klaar ✅\n" + HELP)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed_chat(update):
-        return
     await update.message.reply_text(HELP)
 
+async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "❓ Ik herken dit niet.\n"
+        "Gebruik een van deze commando’s:\n\n" + HELP
+    )
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed_chat(update):
-        return
     chat_id = update.effective_chat.id
-    buf = buffers.get(chat_id, [])
-    count = len(buf)
-    if not count:
-        return await update.message.reply_text("ℹ️ Nog geen slots gedetecteerd.")
-    # Kopie onder lock
-    lock = locks.setdefault(chat_id, threading.Lock())
-    with lock:
-        snapshot = list(buf)
-    await update.message.reply_text(
-        f"📊 Tussentijdse status — {len(snapshot)} slot(s) gevonden:\n\n" + fmt_report(snapshot[:50])
-    )
+    st = SESSIONS.get(chat_id)
+    if not st or not st.task:
+        return await update.message.reply_text("ℹ️ Er draait momenteel geen monitor-sessie.\nGebruik /monitor om te starten.")
 
+    elapsed = int(time.time() - st.started_at)
+    mins = elapsed // 60
+    secs = elapsed % 60
+
+    total = len(st.found)
+    tail = "\n".join([f"• {ts} — {slot}" for ts, slot in st.found[-10:]]) if total else "• (nog niets gevonden)"
+
+    await update.message.reply_text(
+        "📊 Tussentijdse status\n"
+        f"• Verstreken tijd: {mins:02d}:{secs:02d}\n"
+        f"• Totaal gevonden: {total}\n"
+        f"• Laatste 10:\n{tail}"
+    )
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed_chat(update):
-        return
     chat_id = update.effective_chat.id
-    stop_flags[chat_id] = True
-    task = running_task.get(chat_id)
-    if task and not task.done():
-        await update.message.reply_text("⏹️ Stopverzoek ontvangen. Ik rond netjes af…")
-    else:
-        await update.message.reply_text("ℹ️ Er draait momenteel geen monitor-proces.")
+    st = SESSIONS.get(chat_id)
+    if not st or not st.task:
+        return await update.message.reply_text("ℹ️ Er draait momenteel geen monitor-sessie.")
 
-
-async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed_chat(update):
-        return
-    await update.message.reply_text(
-        "❓ Onbekende input.\nGebruik alstublieft:\n\n" + HELP
-    )
-
+    st.stop_flag = True
+    await update.message.reply_text("⏹️ Stopverzoek ontvangen. Ik rond netjes af en stuur het rapport…")
 
 async def monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not allowed_chat(update):
-        return
     chat_id = update.effective_chat.id
+    user = update.effective_user
+    log.info(f"[chat {chat_id}] monitor start aangevraagd door @{user.username or user.id}")
 
-    # Als er al iets draait voor deze chat
-    if chat_id in running_task and running_task[chat_id] and not running_task[chat_id].done():
-        return await update.message.reply_text("⏳ Er draait al een monitor-run. Gebruik /stop om te stoppen.")
+    st = SESSIONS.get(chat_id)
+    if st and st.task and not st.task.done():
+        return await update.message.reply_text("⚠️ Er draait al een monitor-sessie. Gebruik /status of /stop.")
 
-    if not update.message or not update.message.text:
-        return
+    # (re)start state
+    st = MonitorState()
+    SESSIONS[chat_id] = st
 
-    # Parse parameters
-    try:
-        parts = update.message.text.split(" ", 1)
-        if len(parts) != 2:
-            return await update.message.reply_text("❌ Ongeldig formaat.\n\n" + HELP)
-        fields = [p.strip() for p in parts[1].split("|")]
-        if len(fields) != 3:
-            return await update.message.reply_text("❌ Ongeldig formaat.\n\n" + HELP)
+    await update.message.reply_text(
+        "🚀 Monitor gestart voor **week van morgen**.\n"
+        "• Weekends worden overgeslagen\n"
+        "• Alleen slots binnen 3 werkdagen\n"
+        "• Ik stuur elke 5 min een status\n"
+        "• Max duur: 24u of tot /stop\n\n"
+        "Ik ga inloggen en de flow openen…"
+    )
 
-        chassis, merkmodel, datum = fields
-        await update.message.reply_text(
-            "🚀 Monitor start…\n"
-            f"• Chassis: {chassis}\n"
-            f"• Merk/Model: {merkmodel}\n"
-            f"• Inschrijvingsdatum: {datum}\n\n"
-            "Ik volg alle stappen en hou 24u lang alle vrijgekomen slots bij."
-        )
-    except Exception as e:
-        log.exception("parse error")
-        return await update.message.reply_text(f"❌ Fout: {e}")
-
-    # Reset state voor deze chat
-    stop_flags[chat_id] = False
-    buffers[chat_id] = []
-    locks.setdefault(chat_id, threading.Lock())
+    async def periodic_status():
+        start_ts = time.time()
+        while True:
+            await asyncio.sleep(300)  # 5 min
+            # Als task weg is: stoppen
+            if st.task is None or st.task.done():
+                break
+            elapsed = int(time.time() - start_ts)
+            mins = elapsed // 60
+            secs = elapsed % 60
+            total = len(st.found)
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "⏳ Nog bezig met monitoren…\n"
+                        f"• Verstreken tijd: {mins:02d}:{secs:02d}\n"
+                        f"• Gevonden slots tot nu: {total}\n"
+                        f"• Refresh-interval: {Config.REFRESH_DELAY}s"
+                    ),
+                )
+            except Exception as e:
+                log.warning(f"[chat {chat_id}] status push faalde: {e}")
 
     async def runner():
         bot = AIBVMonitorBot()
         try:
-            # 0) driver
+            # Start browser (in aparte thread i.v.m. CPU-bound init)
             try:
-                bot.setup_driver()
+                await asyncio.to_thread(bot.setup_driver)
             except Exception as e:
-                return await update.message.reply_text(f"❌ Browser startte niet: {e}")
+                log.exception(f"[chat {chat_id}] browser start faalde")
+                return await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Fout bij starten van de browser: {e}",
+                )
 
-            # 1) login
-            await update.message.reply_text("🔐 Inloggen…")
-            bot.login()
-            if stop_flags.get(chat_id):
-                return await update.message.reply_text("⏹️ Gestopt na login.")
+            async def push(msg: str):
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=msg)
+                except Exception as e:
+                    log.warning(f"[chat {chat_id}] push mislukte: {e}")
 
-            # 2) voertuig
-            await update.message.reply_text("🚗 Voertuig toevoegen…")
-            bot.add_vehicle(chassis, merkmodel, datum)
-            if stop_flags.get(chat_id):
-                return await update.message.reply_text("⏹️ Gestopt na voertuig toevoegen.")
+            await push("🔐 Inloggen en flow openen…")
 
-            # 3) EU-voertuig
-            await update.message.reply_text("🌍 EU-voertuig selecteren…")
-            bot.select_eu_vehicle()
-            if stop_flags.get(chat_id):
-                return await update.message.reply_text("⏹️ Gestopt na EU-selectie.")
+            # status task
+            status_task: Optional[asyncio.Task] = asyncio.create_task(periodic_status())
 
-            # 4) station
-            await update.message.reply_text("📍 Station selecteren…")
-            bot.select_station()
-            if stop_flags.get(chat_id):
-                return await update.message.reply_text("⏹️ Gestopt na stationselectie.")
+            def stop_checker() -> bool:
+                return st.stop_flag
 
-            await update.message.reply_text("👀 Monitoren gestart (max 24u)… Gebruik /status voor tussentijdse stand, /stop om te stoppen.")
+            def status_hook(snap: dict):
+                st.last_status = snap
 
-            # thread-safe event buffer aanvullen
-            lock = locks[chat_id]
+            # monitoren: 24u of tot stop
+            result = await asyncio.to_thread(bot.monitor_24h_collect, stop_checker, status_hook)
 
-            def on_new_event(ev: dict):
-                with lock:
-                    buffers[chat_id].append(ev)
+            # status task opkuisen
+            if status_task and not status_task.done():
+                status_task.cancel()
+                try:
+                    await status_task
+                except asyncio.CancelledError:
+                    pass
 
-            # stop-check closure
-            def stop_check():
-                return stop_flags.get(chat_id, False)
+            # resultaten opslaan
+            if isinstance(result, dict) and "found" in result:
+                st.found.extend(result["found"])
 
-            # Draai monitor blokkerend in threadpool
-            events = await asyncio.to_thread(
-                bot.monitor_slots,
-                24 * 3600,       # 24u
-                stop_check,
-                on_new_event
+            # rapport opstellen
+            duration = int(time.time() - st.started_at)
+            mins = duration // 60
+            secs = duration % 60
+            total = len(st.found)
+
+            header = "✅ Monitoring gestopt op verzoek." if result.get("ended") == "stopped" else "⏱️ 24u monitoring afgelopen."
+            lines = "\n".join([f"• {ts} — {slot}" for ts, slot in st.found]) if total else "• (geen slots gevonden)"
+            await push(
+                f"{header}\n"
+                f"• Totale duur: {mins:02d}:{secs:02d}\n"
+                f"• Totaal gevonden: {total}\n\n"
+                f"📜 Overzicht:\n{lines}"
             )
 
-            # Eindrapport
-            with locks[chat_id]:
-                snapshot = list(buffers[chat_id])  # alles wat wij live zagen
-            # Voeg events (retour) toe indien nodig (zou identiek moeten zijn)
-            if len(snapshot) < len(events):
-                snapshot = events
-
-            lines = [
-                "🧾 EINDRAPPORT (monitor):",
-                f"• Totale gevonden slots: {len(snapshot)}",
-                "",
-                fmt_report(snapshot[:200])
-            ]
-            await update.message.reply_text("\n".join(lines) or "🧾 Geen slots gedetecteerd.")
         except Exception as e:
-            log.exception("monitor run error")
-            await update.message.reply_text(f"❌ Fout: {e}")
+            log.exception(f"[chat {chat_id}] monitor crashte")
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Fout tijdens monitoring: {e}")
         finally:
             bot.close()
-            # opruimen
-            stop_flags[chat_id] = False
-            running_task.pop(chat_id, None)
-            log.info(f"[chat {chat_id}] monitor afgerond")
+            log.info(f"[chat {chat_id}] monitor beëindigd")
 
-    # Start async task
-    t = asyncio.create_task(runner())
-    running_task[chat_id] = t
+    # start runner
+    st.task = asyncio.create_task(runner())
 
-
+# ---------- App ----------
 def main():
     app = (
         ApplicationBuilder()
-        .token(Config.TELEGRAM_TOKEN)
+        .token(Config.TELEGRAM_TOKEN)           # Zet je MONITOR-bot token als env var TELEGRAM_TOKEN
         .rate_limiter(AIORateLimiter())
         .build()
     )
@@ -242,13 +217,10 @@ def main():
     app.add_handler(CommandHandler("monitor", monitor_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
-
-    # Andere tekst → help
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_message))
 
     log.info("Monitor-bot starting…")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
