@@ -25,7 +25,7 @@ HELP = (
     "/monitor <chassis> | <merk model> | <dd/mm/jjjj>\n"
     "   ➜ Logt in, opent flow, kiest station + week van morgen,\n"
     "     en monitort continu tot /stop of 24u.\n\n"
-    "/status  ➜ Tussentijdse status (aantal nieuwe slots).\n"
+    "/status  ➜ Tussentijdse status (totaal nieuwe slots + laatste 5).\n"
     "/stop    ➜ Stop monitoren & geef rapport.\n"
     "/report  ➜ Toon huidig rapport (tot nu toe).\n"
 )
@@ -54,10 +54,13 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("ℹ️ Er is geen actieve monitor.")
     elapsed = int(time.time() - start_ts)
     mins = elapsed // 60
+    tail = "\n".join(f"• [{ts}] {label}" for ts, label in results[-5:])
+    if tail:
+        tail = "\n\nLaatste 5 slots:\n" + tail
     await update.message.reply_text(
         f"⏳ Monitor actief.\n"
         f"• Verstreken tijd: {mins} min\n"
-        f"• Nieuwe slots gedetecteerd: {len(results)}"
+        f"• Nieuwe slots gedetecteerd: {len(results)}" + tail
     )
 
 
@@ -115,7 +118,7 @@ async def monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🚀 Monitor gestart voor **week van morgen**.\n"
         "• Weekends worden overgeslagen\n"
         "• Alleen slots binnen 3 werkdagen\n"
-        "• Ik stuur elke 5 min een status\n"
+        "• Geen periodieke status-spam; ik stuur enkel iets bij nieuwe slots\n"
         "• Max duur: 24u of tot /stop\n\n"
         "Ik ga inloggen en de flow openen…"
     )
@@ -124,10 +127,6 @@ async def monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         global results, start_ts
 
         bot = AIBVMonitorBot()
-
-        def status_cb(msg: str):
-            # optionele interne status (niet elke 5 min naar user sturen hier)
-            log.info(msg)
 
         try:
             # DRIVER
@@ -156,24 +155,39 @@ async def monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Kon 'week van morgen' niet selecteren in dropdown.")
                 return
 
-            await update.message.reply_text("🔎 Monitoren gestart… (ik meld nieuwe slots zodra ze opduiken)")
+            await update.message.reply_text("🔎 Monitoren gestart… (ik meld elk nieuw slot meteen)")
             start_ts = time.time()
 
-            # Run monitoring in thread (blokkerend Selenium)
-            def _status_push(_msg: str):
-                # we sturen elke 5 min via aparte taak hieronder; hier enkel loggen
-                log.info(_msg)
+            # We gaan een callback meegeven die vanuit een achtergrond-thread
+            # veilig een bericht naar Telegram pusht.
+            loop = asyncio.get_running_loop()
+            chat_id = update.effective_chat.id
 
+            def on_new_slot(ts: str, label: str):
+                # Bewaar in globaal resultaat
+                results.append((ts, label))
+                # Stuur bericht thread-safe naar event loop
+                loop.call_soon_threadsafe(
+                    asyncio.create_task,
+                    context.bot.send_message(
+                        chat_id,
+                        text=f"🆕 Nieuw slot gevonden:\n• [{ts}] {label}"
+                    )
+                )
+
+            # Run monitoring in thread (blokkerend Selenium)
             result = await asyncio.to_thread(
                 bot.monitor_slots,
                 stop_requested,
                 24 * 3600,
-                _status_push
+                on_new_slot,
             )
 
             # Klaar -> bundel rapport
             if result.get("success"):
-                results = result.get("new_slots", [])
+                # results is al live bijgehouden, maar we syncen voor de zekerheid:
+                if result.get("new_slots"):
+                    results = result["new_slots"]
                 if result.get("stopped"):
                     await update.message.reply_text("🛑 Gestopt op jouw verzoek.\n\n" + format_report())
                 elif result.get("timeout"):
@@ -190,30 +204,8 @@ async def monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             bot.close()
 
-    # Periodieke statusberichten (elke 5 min) – zolang runner loopt
-    async def periodic_status(chat_id: int):
-        while running_task and not running_task.done():
-            await asyncio.sleep(300)  # 5 min
-            if start_ts is None:
-                continue
-            elapsed = int(time.time() - start_ts)
-            mins = elapsed // 60
-            try:
-                await context.bot.send_message(
-                    chat_id,
-                    text=(
-                        "⏳ Nog bezig met monitoren…\n"
-                        f"• Verstreken tijd: {mins} min\n"
-                        f"• Nieuwe slots tot nu toe: {len(results)}"
-                    ),
-                )
-            except Exception as e:
-                log.warning(f"Statusbericht mislukt: {e}")
-
-    # Start beide taken
-    chat_id = update.effective_chat.id
+    # Start de runner (async task) zodat de bot responsief blijft
     running_task = asyncio.create_task(runner())
-    asyncio.create_task(periodic_status(chat_id))
 
 
 def main():

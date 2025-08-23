@@ -192,7 +192,7 @@ class AIBVMonitorBot:
         xpaths = [
             "//*[@id='onetrust-accept-btn-handler']",
             "//*[contains(@class,'accept') and contains(.,'Akkoord')]",
-            "//*[contains(@class,'btn') and (contains(.,'Aanvaard') or contains(.,'Accepteer'))]",  # <- let op 'or'
+            "//*[contains(@class,'btn') and (contains(.,'Aanvaard') or contains(.,'Accepteer'))]",
         ]
         for xp in xpaths:
             try:
@@ -385,14 +385,14 @@ class AIBVMonitorBot:
         self,
         stop_requested: Callable[[], bool],
         duration_sec: int = 24 * 3600,
-        status_callback: Optional[Callable[[str], None]] = None,
+        on_new_slot: Optional[Callable[[str, str], None]] = None,  # (timestamp_seen, label)
     ) -> Dict:
         """
         Refresh de pagina tot duration_sec of stop.
         Retourneert dict met 'new_slots': List[(ts_seen, label)] en meta.
+        Roept on_new_slot(ts, label) aan bij elk nieuw gevonden slot.
         """
         start = time.time()
-        next_status = start + 300  # elke 5 min
         seen: set[str] = set()
         new_events: List[Tuple[str, str]] = []  # (timestamp_seen, slot_label)
 
@@ -423,31 +423,28 @@ class AIBVMonitorBot:
 
             # Zorg dat week niet verspringt
             try:
-                # dropdown aanwezig?
                 WebDriverWait(self.driver, 8).until(
                     EC.presence_of_element_located((By.ID, "MainContent_lbSelectWeek"))
                 )
             except TimeoutException:
-                # terug opbouwen (eenmalig)
                 self.select_station()
                 self.select_week_of_tomorrow()
 
             # juiste week blijft behouden; alleen **echte refresh**
             slots = self._collect_slots()
+
             # detecteer nieuw
             for _, label in slots:
                 if label not in seen:
                     seen.add(label)
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     new_events.append((ts, label))
-
-            # status (optioneel)
-            if status_callback and time.time() >= next_status:
-                next_status += 300
-                try:
-                    status_callback("⏳ Monitor actief, nog bezig met verversen…")
-                except Exception:
-                    pass
+                    # push direct naar Telegram (indien callback)
+                    if on_new_slot:
+                        try:
+                            on_new_slot(ts, label)
+                        except Exception as e:
+                            log.warning(f"on_new_slot callback error: {e}")
 
             # refresh + korte pauze
             self.driver.refresh()
