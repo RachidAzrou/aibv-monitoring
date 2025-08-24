@@ -10,6 +10,8 @@ from telegram.ext import (
     AIORateLimiter, MessageHandler, filters
 )
 
+from selenium.common.exceptions import TimeoutException  # <-- FIX: toegevoegd
+
 from config import Config
 from selenium_monitor import AIBVMonitorBot
 
@@ -158,15 +160,12 @@ async def monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🔎 Monitoren gestart… (ik meld elk nieuw slot meteen)")
             start_ts = time.time()
 
-            # We gaan een callback meegeven die vanuit een achtergrond-thread
-            # veilig een bericht naar Telegram pusht.
+            # Event loop/Chat-id voor thread-safe berichten
             loop = asyncio.get_running_loop()
             chat_id = update.effective_chat.id
 
             def on_new_slot(ts: str, label: str):
-                # Bewaar in globaal resultaat
                 results.append((ts, label))
-                # Stuur bericht thread-safe naar event loop
                 loop.call_soon_threadsafe(
                     asyncio.create_task,
                     context.bot.send_message(
@@ -185,7 +184,6 @@ async def monitor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Klaar -> bundel rapport
             if result.get("success"):
-                # results is al live bijgehouden, maar we syncen voor de zekerheid:
                 if result.get("new_slots"):
                     results = result["new_slots"]
                 if result.get("stopped"):
