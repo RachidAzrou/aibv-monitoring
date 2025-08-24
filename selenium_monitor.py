@@ -192,7 +192,7 @@ class AIBVMonitorBot:
         xpaths = [
             "//*[@id='onetrust-accept-btn-handler']",
             "//*[contains(@class,'accept') and contains(.,'Akkoord')]",
-            "//*[contains(@class,'btn') and (contains(.,'Aanvaard') or contains(.,'Accepteer'))]",
+            "//*[contains(@class,'btn') and (contains(.,'Aanvaard') or contains(.,'Accepteer'))]",  # let op: 'or'
         ]
         for xp in xpaths:
             try:
@@ -220,6 +220,36 @@ class AIBVMonitorBot:
         except Exception:
             pass
 
+    # ---------- Nieuwe helpers voor robuuste login ----------
+    def _wait_any_present(self, locators, timeout: int = 20):
+        """
+        Wacht tot één van de meegegeven locators aanwezig is.
+        locators: List[Tuple[By, selector]]
+        """
+        end = time.time() + timeout
+        last_err = None
+        while time.time() < end:
+            for by, sel in locators:
+                try:
+                    el = self.driver.find_element(by, sel)
+                    if el:
+                        return el
+                except Exception as e:
+                    last_err = e
+            time.sleep(0.2)
+        raise TimeoutException(f"_wait_any_present timed out after {timeout}s. Last error: {last_err}")
+
+    def _dbg_context(self) -> str:
+        try:
+            url = self.driver.current_url
+        except Exception:
+            url = "(geen url)"
+        try:
+            title = self.driver.title
+        except Exception:
+            title = "(geen titel)"
+        return f"URL='{url}', TITLE='{title}'"
+
     # ---------------- Flow (geen boeking) ----------------
     def login(self):
         d = self.driver
@@ -228,31 +258,55 @@ class AIBVMonitorBot:
         self.try_accept_cookies_and_set_lang()
 
         # velden invullen
-        self._fill_login_fields(Config.AIBV_USERNAME, Config.AIBV_PASSWORD)
+        try:
+            self._fill_login_fields(Config.AIBV_USERNAME, Config.AIBV_PASSWORD)
+        except Exception as e:
+            raise TimeoutException(f"Loginvelden niet gevonden/gevuld. {self._dbg_context()} | {e}")
 
         # Aanmelden
-        self.click_by_id("Button1")
-
-        # Als postback hapert: één JS-click retry
         try:
-            WebDriverWait(d, 6).until(
-                EC.presence_of_element_located((By.XPATH, "//*[contains(@id,'MainContent_btnVoertuigToevoegen') or contains(.,'Reservatie')]"))
+            self.click_by_id("Button1")
+        except Exception as e:
+            raise TimeoutException(f"Kon Aanmelden-knop niet klikken. {self._dbg_context()} | {e}")
+
+        # Postback/redirect kan traag zijn; wacht op meerdere mogelijke signalen
+        try:
+            self._wait_any_present(
+                [
+                    (By.ID, "MainContent_cmdReservatieAutokeuringAanmaken"),   # directe knop
+                    (By.ID, "MainContent_btnVoertuigToevoegen"),               # soms al op detail
+                    (By.XPATH, "//input[@type='submit' and contains(@value,'Reservatie')]"),
+                ],
+                timeout=25,
             )
         except TimeoutException:
+            # Eén JS-retry op Button1
             try:
                 btn = d.find_element(By.ID, "Button1")
                 d.execute_script("arguments[0].click();", btn)
+                self.wait_dom_idle()
             except Exception:
                 pass
 
-        self.switch_to_latest_window(timeout=8)
-        self.wait_dom_idle()
+        # Nogmaals wachten op iets bruikbaars
+        try:
+            self._wait_any_present(
+                [
+                    (By.ID, "MainContent_cmdReservatieAutokeuringAanmaken"),
+                    (By.ID, "MainContent_btnVoertuigToevoegen"),
+                    (By.XPATH, "//input[@type='submit' and contains(@value,'Reservatie')]"),
+                ],
+                timeout=20,
+            )
+        except TimeoutException as e:
+            raise TimeoutException(f"Na login geen bekende elementen. {self._dbg_context()} | {e}")
 
-        # “Reservatie aanmaken”
+        # Probeer “Reservatie aanmaken”
         try:
             self.click_by_id("MainContent_cmdReservatieAutokeuringAanmaken")
             self.wait_dom_idle()
         except Exception:
+            # Fallback: ga naar overzicht en klik vandaar
             d.get("https://planning.aibv.be/Reservaties/ReservatieOverzicht.aspx?lang=nl")
             self.wait_dom_idle()
             try:
@@ -262,16 +316,23 @@ class AIBVMonitorBot:
                 d.execute_script("arguments[0].click();", btn)
                 self.wait_dom_idle()
             except TimeoutException:
-                btn = WebDriverWait(d, 10).until(
-                    EC.element_to_be_clickable((By.XPATH, "//input[@type='submit' and contains(@value,'Reservatie')]"))
-                )
-                d.execute_script("arguments[0].click();", btn)
-                self.wait_dom_idle()
+                # ultieme fallback: zoek generieke “Reservatie” submit
+                try:
+                    btn = WebDriverWait(d, 8).until(
+                        EC.element_to_be_clickable((By.XPATH, "//input[@type='submit' and contains(@value,'Reservatie')]"))
+                    )
+                    d.execute_script("arguments[0].click();", btn)
+                    self.wait_dom_idle()
+                except Exception as e2:
+                    raise TimeoutException(f"Kon 'Reservatie aanmaken' niet bereiken. {self._dbg_context()} | {e2}")
 
-        # wachten tot “Voertuig toevoegen” verschijnt
-        WebDriverWait(d, 20).until(
-            EC.presence_of_element_located((By.ID, "MainContent_btnVoertuigToevoegen"))
-        )
+        # Tot slot moet “Voertuig toevoegen” zichtbaar zijn
+        try:
+            WebDriverWait(d, 20).until(
+                EC.presence_of_element_located((By.ID, "MainContent_btnVoertuigToevoegen"))
+            )
+        except TimeoutException as e:
+            raise TimeoutException(f"'Voertuig toevoegen' verscheen niet. {self._dbg_context()} | {e}")
 
     def add_vehicle(self, chassis: str, merk_model: str, inschrijfdatum_ddmmyyyy: str):
         self.chassis = chassis
@@ -385,14 +446,14 @@ class AIBVMonitorBot:
         self,
         stop_requested: Callable[[], bool],
         duration_sec: int = 24 * 3600,
-        on_new_slot: Optional[Callable[[str, str], None]] = None,  # (timestamp_seen, label)
+        status_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict:
         """
         Refresh de pagina tot duration_sec of stop.
         Retourneert dict met 'new_slots': List[(ts_seen, label)] en meta.
-        Roept on_new_slot(ts, label) aan bij elk nieuw gevonden slot.
         """
         start = time.time()
+        next_status = start + 300  # elke 5 min
         seen: set[str] = set()
         new_events: List[Tuple[str, str]] = []  # (timestamp_seen, slot_label)
 
@@ -423,28 +484,31 @@ class AIBVMonitorBot:
 
             # Zorg dat week niet verspringt
             try:
+                # dropdown aanwezig?
                 WebDriverWait(self.driver, 8).until(
                     EC.presence_of_element_located((By.ID, "MainContent_lbSelectWeek"))
                 )
             except TimeoutException:
+                # terug opbouwen (eenmalig)
                 self.select_station()
                 self.select_week_of_tomorrow()
 
             # juiste week blijft behouden; alleen **echte refresh**
             slots = self._collect_slots()
-
             # detecteer nieuw
             for _, label in slots:
                 if label not in seen:
                     seen.add(label)
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     new_events.append((ts, label))
-                    # push direct naar Telegram (indien callback)
-                    if on_new_slot:
-                        try:
-                            on_new_slot(ts, label)
-                        except Exception as e:
-                            log.warning(f"on_new_slot callback error: {e}")
+
+            # status (optioneel)
+            if status_callback and time.time() >= next_status:
+                next_status += 300
+                try:
+                    status_callback("⏳ Monitor actief, nog bezig met verversen…")
+                except Exception:
+                    pass
 
             # refresh + korte pauze
             self.driver.refresh()
